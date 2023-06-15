@@ -18,8 +18,14 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+#ifdef VM
+#include "vm/frame.h"
+#include "vm/page.h"
+#endif
+
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+void push_into_stack(const char* [], int, void**);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -29,6 +35,8 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
+  char* command_part; // @@ added by student, for parse file_name into command and argument
+  char* save_ptr;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
@@ -38,11 +46,41 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /* @@ added by student: save the command line */
+  file_name_global = palloc_get_page(0);
+  if (file_name_global == NULL) // make sure palloc success
+      goto fail_execute;
+  strlcpy(file_name_global, fn_copy, PGSIZE);
+
+  // @@ Added by student: palloc page in user pool
+  command_part = palloc_get_page(0);
+  if (command_part == NULL) // make sure palloc success
+      goto fail_execute;
+  command_part = strtok_r(file_name, " ", &save_ptr); // parse file_name
+  /* End */
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  // tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create(command_part, PRI_DEFAULT, start_process, fn_copy); // @ modified by student
+  
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+      goto fail_execute;
+
+
   return tid;
+
+  /* @@ Added by student: fail execute */
+fail_execute:
+  // if here to avoid fail by lib (palloc free (NULL) error)
+  if (fn_copy)
+      palloc_free_page(fn_copy);
+  if (command_part)
+      palloc_free_page(command_part);
+  if (save_ptr)
+      palloc_free_page(save_ptr);
+
+  return TID_ERROR;
+  /* End */
 }
 
 /* A thread function that loads a user process and starts it
@@ -53,6 +91,36 @@ start_process (void *file_name_)
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+
+  /**
+  * @@ Added by student:
+  * Split command line and push all pieces into stack
+  */
+
+  const char** cmd_tokens = (const char**)palloc_get_page(0);
+
+  if (cmd_tokens == NULL)
+  {
+      printf("[Error kernel] Heap is full !!!");
+      goto finish_step;
+  }
+
+  char* token;
+  char* save_ptr; // just for strtok_r
+  int count = 0;
+
+  /* parse and store */
+  token = strtok_r(file_name, " ", &save_ptr);
+  while (token != NULL)
+  {
+      cmd_tokens[count] = token; // store command, option and argument of itself
+      token = strtok_r(NULL, " ", &save_ptr);
+      count++;
+  }
+  /* End */
+
+  /* We load ELF binaries.  The following definitions are taken
+   from the ELF specification, [ELF1], more-or-less verbatim.  */
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
