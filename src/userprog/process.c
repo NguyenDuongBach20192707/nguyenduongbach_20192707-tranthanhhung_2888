@@ -119,8 +119,6 @@ start_process (void *file_name_)
   }
   /* End */
 
-  /* We load ELF binaries.  The following definitions are taken
-   from the ELF specification, [ELF1], more-or-less verbatim.  */
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -129,10 +127,21 @@ start_process (void *file_name_)
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  /**
+  * @@ Added by student: to check if load success of fail
+  * print termination message here via syscall_exit(-1); !!!
+  */
+  if (success)
+      push_into_stack(cmd_tokens, count, &if_.esp);
+  else
+      goto finish_step;
+
+finish_step:
+  if (cmd_tokens)
+      palloc_free_page(cmd_tokens);
+  if (file_name)
+      palloc_free_page(file_name);
+  syscall_exit(-1);
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -140,7 +149,10 @@ start_process (void *file_name_)
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
-  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+  asm volatile ("movl %0, %%esp; jmp intr_exit" 
+      : 
+      : "g" (&if_) 
+      : "memory");
   NOT_REACHED ();
 }
 
@@ -153,18 +165,28 @@ start_process (void *file_name_)
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int
-process_wait (tid_t child_tid UNUSED) 
+int process_wait (tid_t child_tid UNUSED) 
+{
+    /* @@Added by student: "raw" wait to parent pro collect all zombies of it's childs */
+    long int i;
+    for (i = 0; i < 1000000000; i++)
+    {
+        // NULL
 {
   return -1;
 }
 
 /* Free the current process's resources. */
-void
-process_exit (void)
+void process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  // @@@ Added by student: destroy SUPT (all SPTEs, all frame and swap)
+  #ifdef VM
+  vm_supt_destroy(cur->supt);
+  cur->supt = NULL;
+  #endif
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -187,8 +209,7 @@ process_exit (void)
 /* Sets up the CPU for running user code in the current
    thread.
    This function is called on every context switch. */
-void
-process_activate (void)
+void process_activate (void)
 {
   struct thread *t = thread_current ();
 
@@ -199,7 +220,56 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
+/**
+ * @@ Added by student: to push all command line tokens into stack
+ * (with the right arranged rule in reference)
+ */
+void push_into_stack(const char* cmdline_tokens[], int argc, void** esp)
+{
+    ASSERT(argc >= 0);
+
+    int length_of_token = 0;
+    void* argv_addr[argc];
+
+    // push push push
+    int i;
+    for (i = argc - 1; i >= 0; i--)
+    {
+        length_of_token = strlen(cmdline_tokens[i]) + 1; // + 1 character NULL
+        *esp -= length_of_token;                         // grown downwards as reference
+        memcpy(*esp, cmdline_tokens[i], length_of_token);
+        argv_addr[i] = *esp; // to mark addrress
+    }
+
+    // word align
+    *esp -= 1;
+
+    // last null: ensure argv[argc] is null, reference
+    *esp -= 4;
+    *((uint32_t*)*esp) = 0;
+
+    // setting **esp with argvs
+    for (i = argc - 1; i >= 0; i--)
+    {
+        *esp -= 4;
+        *((void**)*esp) = argv_addr[i];
+    }
+
+    // setting **argv (addr of stack, esp)
+    *esp -= 4;
+    *((void**)*esp) = (*esp + 4);
+
+    // setting argc
+    *esp -= 4;
+    *((int*)*esp) = argc;
+
+    // setting ret addr (return address)
+    *esp -= 4;
+    *((int*)*esp) = 0;
+}
+/* End */
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -285,6 +355,13 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
+
+  // @@@ Added by student: supt create step
+  #ifdef VM
+  t->supt = vm_supt_create();
+  #endif
+
+
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
@@ -383,7 +460,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   file_close (file);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -464,6 +541,21 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
+      /**
+   * @@@ Added by student: implement lazy load
+   */
+#ifdef VM
+      struct thread* curr = thread_current();
+      ASSERT(pagedir_get_page(curr->pagedir, upage) == NULL); // not virtual page yet
+
+      if (!vm_supt_install_filesys(curr->supt, upage,
+          file, ofs, page_read_bytes, page_zero_bytes, writable))
+      {
+          return false;
+      }
+
+#else
+
       /* Get a page of memory. */
       uint8_t *kpage = palloc_get_page (PAL_USER);
       if (kpage == NULL)
@@ -484,13 +576,13 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           return false; 
         }
 
+#endif
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
     }
-  return true;
-}
+
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
@@ -528,6 +620,13 @@ install_page (void *upage, void *kpage, bool writable)
 
   /* Verify that there's not already a page at that virtual
      address, then map our page there. */
-  return (pagedir_get_page (t->pagedir, upage) == NULL
-          && pagedir_set_page (t->pagedir, upage, kpage, writable));
+  bool success = (pagedir_get_page(t->pagedir, upage) == NULL);
+  success = success && pagedir_set_page(t->pagedir, upage, kpage, writable);
+
+#ifdef VM
+  success = success && vm_supt_install_frame(t->supt, upage, kpage);
+  if (success)
+      vm_frame_unpin(kpage);
+#endif
+  return success;
 }
